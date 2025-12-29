@@ -1,113 +1,130 @@
-name: RDP
+name: SSH Ubuntu Access
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
+  secure-ssh:
+    runs-on: ubuntu-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Configure SSH Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          # Enable SSH service
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
           
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          # Configure SSH for security
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          
+          # Restart SSH service to apply changes
+          sudo systemctl restart ssh
+          
+          # Configure firewall to allow SSH (port 22)
+          sudo ufw allow 22/tcp
+          sudo ufw --force enable
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
+      - name: Create SSH User with Secure Password
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          # Generate secure random password
+          password=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          # Create user with sudo privileges
+          sudo useradd -m -s /bin/bash -G sudo ssh-user
+          echo "ssh-user:$password" | sudo chpasswd
           
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
+          # Ensure user can sudo without password for convenience
+          echo "ssh-user ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/ssh-user
+          
+          # Store credentials in environment
+          echo "SSH_CREDS=User: ssh-user | Password: $password" >> $GITHUB_ENV
+          
+          # Verify user creation
+          if ! id ssh-user &>/dev/null; then
+              echo "User creation failed"
               exit 1
-          }
+          fi
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          # Add Tailscale repository
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg > /dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
           
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          # Update package list and install Tailscale
+          sudo apt-get update
+          sudo apt-get install -y tailscale
 
       - name: Establish Tailscale Connection
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-ubuntu-runner-$GITHUB_RUN_ID
           
           # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
+          retries=0
+          while [ $retries -lt 10 ]; do
+              tsip=$(tailscale ip -4 2>/dev/null)
+              if [ -n "$tsip" ]; then
+                  echo "TAILSCALE_IP=$tsip" >> $GITHUB_ENV
+                  break
+              fi
+              sleep 5
+              retries=$((retries + 1))
+          done
           
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+          if [ -z "$tsip" ]; then
+              echo "Tailscale IP not assigned. Exiting."
               exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          fi
       
-      - name: Verify RDP Accessibility
+      - name: Verify SSH Accessibility
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          echo "Tailscale IP: $TAILSCALE_IP"
           
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+          # Test SSH connectivity
+          if nc -zv $TAILSCALE_IP 22 2>&1 | grep -q "succeeded"; then
+              echo "SSH connectivity test successful!"
+          else
+              echo "SSH connection test failed"
               exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          fi
+
+      - name: Install Additional Tools (Optional)
+        run: |
+          # Install useful tools for remote work
+          sudo apt-get update
+          sudo apt-get install -y \
+            htop \
+            neofetch \
+            git \
+            curl \
+            wget \
+            vim \
+            tmux \
+            tree \
+            unzip
+          
+          # Display system info
+          neofetch
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          echo ""
+          echo "=== SSH ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Port: 22"
+          echo "Username: ssh-user"
+          echo "Password: $(echo $SSH_CREDS | cut -d'|' -f2 | cut -d':' -f2 | xargs)"
+          echo "=================="
+          echo ""
+          echo "Connect using: ssh ssh-user@$TAILSCALE_IP"
+          echo ""
           
           # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+          while true; do
+              echo "[$(date)] SSH Active - Use Ctrl+C in workflow to terminate"
+              sleep 300
+          done
