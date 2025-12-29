@@ -48,6 +48,20 @@ jobs:
               exit 1
           fi
 
+      - name: Install VNC Server
+        run: |
+          sudo apt-get install -y ubuntu-desktop-minimal
+          sudo apt-get install -y tightvncserver
+          # Configure VNC (port 5901)
+
+      - name: Install XRDP
+        run: |
+          sudo apt-get install -y ubuntu-desktop-minimal
+          sudo apt-get install -y xrdp
+          sudo systemctl enable xrdp
+          sudo systemctl start xrdp
+          sudo ufw allow 3389/tcp
+
       - name: Install Tailscale
         run: |
           # Add Tailscale repository
