@@ -1,0 +1,82 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp-ubuntu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 3600
+
+    steps:
+      - name: Update System
+        run: |
+          sudo apt update && sudo apt upgrade -y
+
+      - name: Install Desktop + XRDP
+        run: |
+          sudo apt install -y xfce4 xfce4-goodies
+          sudo apt install -y xrdp
+          sudo systemctl enable xrdp
+
+          # Make XFCE default session
+          echo xfce4-session > ~/.xsession
+
+      - name: Create RDP User with Secure Password
+        run: |
+          PASS="$(tr -dc A-Za-z0-9@#%&+= < /dev/urandom | head -c 16)"
+          echo "RDP password: $PASS"
+          echo "RDP_CREDS=$PASS" >> $GITHUB_ENV
+
+          sudo useradd -m -s /bin/bash rdpuser
+          echo "rdpuser:$PASS" | sudo chpasswd
+          sudo usermod -aG sudo rdpuser
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Tailscale Login
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=ubuntu-runner-$GITHUB_RUN_ID
+
+          # wait for IP
+          for i in {1..10}; do
+            IP=$(tailscale ip -4)
+            if [[ ! -z "$IP" ]]; then break; fi
+            sleep 3
+          done
+
+          if [[ -z "$IP" ]]; then
+            echo "Failed to obtain Tailscale IP"
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$IP" >> $GITHUB_ENV
+
+      - name: Restrict RDP to Tailscale Network Only
+        run: |
+          # block port 3389 from public
+          sudo ufw allow from 100.64.0.0/10 to any port 3389
+          sudo ufw enable
+
+      - name: Show Connection Info
+        run: |
+          echo "========================================="
+          echo "        UBUNTU RDP ACCESS (SAFE)         "
+          echo "========================================="
+          echo "Tailscale IP  : $TAILSCALE_IP"
+          echo "Username      : rdpuser"
+          echo "Password      : $RDP_CREDS"
+          echo "-----------------------------------------"
+          echo "Connect using: mstsc.exe  (Windows RDP)"
+          echo "   Computer: $TAILSCALE_IP"
+          echo "========================================="
+
+      - name: Keep Alive
+        run: |
+          echo "RDP session active. Press Ctrl+C to stop workflow."
+          while true; do
+            echo "[$(date)] RDP Running..."
+            sleep 300
+          done
